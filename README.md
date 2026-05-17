@@ -27,7 +27,7 @@ It automates task execution by:
 ## Installation
 
 ```bash
-npm install -g @agentrq/codex-gateway
+npm install -g @agentrq/codex-gateway@latest
 ```
 
 ## Setup
