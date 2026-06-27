@@ -1,6 +1,6 @@
 {
   "name": "@agentrq/codex-gateway",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "MCP bridge CLI for agentrq workspaces using OpenAI Codex",
   "type": "module",
   "publishConfig": {
