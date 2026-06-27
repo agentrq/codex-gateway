@@ -30,7 +30,7 @@ describe("taskIdentity", () => {
   });
 
   describe("extractTaskIdFromText", () => {
-    it("should extract task ID from agentrq getNextTask format", () => {
+    it("should extract task ID from agentrq getTask format", () => {
       expect(
         extractTaskIdFromText("Next assigned task: ID: 0cHj7oddOUb Title: echo what I say"),
       ).toBe("0cHj7oddOUb");
