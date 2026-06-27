@@ -152,7 +152,9 @@ export async function checkForNextTask(
 ): Promise<void> {
   console.error("[bridge] Checking for next task via MCP server...");
   try {
-    const result = await mcpBridge.callTool("getNextTask");
+    // getTask with no taskId dequeues the next "not started" task assigned to
+    // this agent (formerly the getNextTask tool, merged in agentrq v0.3.6).
+    const result = await mcpBridge.callTool("getTask");
 
     if (result.isError) {
       console.error("[mcp] Error getting next task:", result.content);

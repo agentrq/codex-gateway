@@ -13,7 +13,7 @@ export function extractTaskIdFromMeta(meta: unknown): string | undefined {
 /** Try to extract taskId from text content as a fallback. */
 export function extractTaskIdFromText(text: string): string | undefined {
   const patterns = [
-    /Next assigned task:\s*ID:\s*([a-zA-Z0-9_-]+)/i, // agentrq getNextTask format
+    /Next assigned task:\s*ID:\s*([a-zA-Z0-9_-]+)/i, // agentrq getTask format
     /Task ID[:\s]+([a-zA-Z0-9_-]+)/i,
     /Response to task[:\s]+([a-zA-Z0-9_-]+)/i,
     /task[:\s]+([a-zA-Z0-9_-]+)/i,

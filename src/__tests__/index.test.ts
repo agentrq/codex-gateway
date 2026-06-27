@@ -420,7 +420,7 @@ describe("index", () => {
         new Map(),
       );
 
-      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getNextTask");
+      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getTask");
       expect(mockCodexClient.startThread).not.toHaveBeenCalled();
     });
 
@@ -440,11 +440,11 @@ describe("index", () => {
     });
 
     it("should process a task and recurse", async () => {
-      let getNextTaskCalls = 0;
+      let getTaskCalls = 0;
       mockMcpBridge.callTool.mockImplementation((name: string) => {
-        if (name === "getNextTask") {
-          getNextTaskCalls++;
-          if (getNextTaskCalls === 1) {
+        if (name === "getTask") {
+          getTaskCalls++;
+          if (getTaskCalls === 1) {
             return Promise.resolve({
               isError: false,
               content: [{ type: "text", text: "Task ID: T1\ndo something" }],
@@ -464,7 +464,7 @@ describe("index", () => {
         new Map(),
       );
 
-      expect(getNextTaskCalls).toBe(2);
+      expect(getTaskCalls).toBe(2);
       expect(mockCodexClient.startTurn).toHaveBeenCalledWith(
         expect.any(String),
         expect.stringContaining("Task ID: T1\ndo something"),
