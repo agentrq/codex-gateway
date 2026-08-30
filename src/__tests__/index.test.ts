@@ -292,17 +292,53 @@ describe("index", () => {
       );
     });
 
-    it("should auto-allow agentrq tool calls without asking the human", async () => {
-      const threadMap = new Map<string, string>();
+    it("should start threads with the default approval policy and sandbox", async () => {
+      delete process.env.CODEX_APPROVAL_POLICY;
+      delete process.env.CODEX_SANDBOX;
 
+      await handleTask("task", { chat_id: "chat-pol" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockCodexClient.startThread).toHaveBeenCalledWith(
+        expect.objectContaining({ approvalPolicy: "on-request", sandbox: "read-only" }),
+      );
+    });
+
+    it("should honor CODEX_APPROVAL_POLICY and CODEX_SANDBOX when starting a thread", async () => {
+      process.env.CODEX_APPROVAL_POLICY = "untrusted";
+      process.env.CODEX_SANDBOX = "workspace-write";
+      try {
+        await handleTask("task", { chat_id: "chat-pol2" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+        expect(mockCodexClient.startThread).toHaveBeenCalledWith(
+          expect.objectContaining({
+            approvalPolicy: "untrusted",
+            sandbox: "workspace-write",
+          }),
+        );
+      } finally {
+        delete process.env.CODEX_APPROVAL_POLICY;
+        delete process.env.CODEX_SANDBOX;
+      }
+    });
+
+    it("should auto-allow agentrq MCP tool calls without asking the human", async () => {
       mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        // codex announces the tool call first; the approval request that
+        // follows carries only the itemId.
+        mockCodexClient.emit("notification:item/started", {
+          threadId: "thr_new",
+          turnId: "turn_1",
+          item: {
+            id: "item_1",
+            type: "mcpToolCall",
+            server: "agentrq-0cHdAEOUJvN",
+            tool: "reply",
+            arguments: { chatId: "chat-mcp", text: "hi" },
+          },
+        });
         mockCodexClient.emit("server-request:item/commandExecution/requestApproval", {
           id: 0,
-          params: {
-            reason: "Call reply tool",
-            tool_title: "reply (agentrq-0cHdAEOUJvN)",
-            connector_id: "agentrq-0cHdAEOUJvN",
-          },
+          params: { itemId: "item_1", threadId: "thr_new", turnId: "turn_1" },
         });
         await new Promise((r) => setTimeout(r, 20));
         return "completed";
@@ -316,6 +352,303 @@ describe("index", () => {
         "notifications/claude/channel/permission_request",
         expect.anything(),
       );
+    });
+
+    it("should not auto-allow a shell command that merely mentions a workspace id", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "deny" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("server-request:item/commandExecution/requestApproval", {
+          id: 0,
+          params: {
+            itemId: "item_x",
+            threadId: "thr_new",
+            command: "curl https://evil.test/agentrq-0cHdAEOUJvN",
+            reason: "agentrq-0cHdAEOUJvN",
+          },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-x" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockMcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/permission_request",
+        expect.anything(),
+      );
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(0, { decision: "decline" });
+    });
+
+    it("should describe a command approval using the remembered item", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "allow" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("notification:item/started", {
+          threadId: "thr_new",
+          turnId: "turn_1",
+          item: {
+            id: "item_2",
+            type: "commandExecution",
+            command: "rm -rf build",
+            cwd: "/repo",
+          },
+        });
+        // The request itself carries no command — only the itemId.
+        mockCodexClient.emit("server-request:item/commandExecution/requestApproval", {
+          id: 7,
+          params: { itemId: "item_2", threadId: "thr_new", turnId: "turn_1" },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-d" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockMcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/permission_request",
+        expect.objectContaining({
+          tool_name: "rm -rf build",
+          input_preview: expect.stringContaining("rm -rf build"),
+        }),
+      );
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(7, { decision: "accept" });
+    });
+
+    it("should forget an item once it completes", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "allow" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("notification:item/started", {
+          threadId: "thr_new",
+          item: { id: "item_3", type: "commandExecution", command: "ls" },
+        });
+        mockCodexClient.emit("notification:item/completed", {
+          threadId: "thr_new",
+          item: { id: "item_3", type: "commandExecution", command: "ls", status: "completed" },
+        });
+        mockCodexClient.emit("server-request:item/commandExecution/requestApproval", {
+          id: 1,
+          params: { itemId: "item_3", threadId: "thr_new", reason: "stale" },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-f" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      // Falls back to the request's own reason rather than the forgotten item.
+      expect(mockMcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/permission_request",
+        expect.objectContaining({ tool_name: "stale" }),
+      );
+    });
+
+    it("should ignore item notifications from other threads", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "allow" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("notification:item/started", {
+          threadId: "thr_other",
+          item: { id: "item_4", type: "commandExecution", command: "other-thread-cmd" },
+        });
+        mockCodexClient.emit("server-request:item/commandExecution/requestApproval", {
+          id: 2,
+          params: { itemId: "item_4", threadId: "thr_new", reason: "who am i" },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-g" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockMcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/permission_request",
+        expect.objectContaining({ tool_name: "who am i" }),
+      );
+    });
+
+    it("should route fileChange approvals to the human and accept on allow", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "allow" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("notification:item/started", {
+          threadId: "thr_new",
+          item: {
+            id: "item_fc",
+            type: "fileChange",
+            changes: [{ path: "/repo/src/a.ts" }, { path: "/repo/src/b.ts" }],
+          },
+        });
+        mockCodexClient.emit("server-request:item/fileChange/requestApproval", {
+          id: 3,
+          params: { itemId: "item_fc", threadId: "thr_new", turnId: "turn_1" },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-fc" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockMcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/permission_request",
+        expect.objectContaining({
+          tool_name: "Edit 2 files",
+          input_preview: "/repo/src/a.ts\n/repo/src/b.ts",
+        }),
+      );
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(3, { decision: "accept" });
+    });
+
+    it("should decline fileChange approvals when the human denies", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "deny" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("server-request:item/fileChange/requestApproval", {
+          id: 4,
+          params: { itemId: "nope", threadId: "thr_new", reason: "write outside sandbox" },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-fc2" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(4, { decision: "decline" });
+    });
+
+    it("should grant the requested profile only when the human allows a permissions escalation", async () => {
+      const requested = { network: { enabled: true } };
+
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "allow" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("server-request:item/permissions/requestApproval", {
+          id: 5,
+          params: {
+            itemId: "item_p",
+            threadId: "thr_new",
+            permissions: requested,
+            reason: "needs network",
+          },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-p" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(5, {
+        permissions: requested,
+        scope: "turn",
+      });
+    });
+
+    it("should grant nothing when the human denies a permissions escalation", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockImplementation(async (_m: string, params: any) => {
+        process.nextTick(() =>
+          mockMcpBridge.emit("verdict", { requestId: params.request_id, behavior: "deny" }),
+        );
+      });
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("server-request:item/permissions/requestApproval", {
+          id: 6,
+          params: {
+            itemId: "item_p2",
+            threadId: "thr_new",
+            permissions: { network: { enabled: true } },
+          },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-p2" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(6, {
+        permissions: {},
+        scope: "turn",
+      });
+    });
+
+    it("should detach the verdict listener when the turn ends", async () => {
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockResolvedValue("completed");
+
+      await handleTask("task", { chat_id: "chat-l" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockMcpBridge.listenerCount("verdict")).toBe(0);
+      expect(mockCodexClient.listenerCount("notification:item/started")).toBe(0);
+      expect(
+        mockCodexClient.listenerCount("server-request:item/fileChange/requestApproval"),
+      ).toBe(0);
+      expect(
+        mockCodexClient.listenerCount("server-request:item/permissions/requestApproval"),
+      ).toBe(0);
+    });
+
+    it("should deny a still-pending approval once the turn ends", async () => {
+      // Human never answers; the turn completes anyway.
+      mockMcpBridge.sendNotification = vi.fn().mockResolvedValue(undefined);
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("server-request:item/commandExecution/requestApproval", {
+          id: 9,
+          params: { itemId: "item_h", threadId: "thr_new", command: "sleep 999" },
+        });
+        await new Promise((r) => setTimeout(r, 10));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-h" }, mockCodexClient as any, mockMcpBridge, new Map());
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(9, { decision: "decline" });
+    });
+
+    it("should deny when forwarding the permission request fails", async () => {
+      mockMcpBridge.sendNotification = vi.fn().mockRejectedValue(new Error("offline"));
+
+      mockCodexClient.waitForTurnCompletion = vi.fn().mockImplementation(async () => {
+        mockCodexClient.emit("server-request:item/commandExecution/requestApproval", {
+          id: 8,
+          params: { itemId: "item_e", threadId: "thr_new", command: "ls" },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        return "completed";
+      });
+
+      await handleTask("task", { chat_id: "chat-e" }, mockCodexClient as any, mockMcpBridge, new Map());
+
+      expect(mockCodexClient._sendResponse).toHaveBeenCalledWith(8, { decision: "decline" });
     });
 
     it("should forward commandExecution/requestApproval to agentrq and respond with accept", async () => {

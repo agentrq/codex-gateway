@@ -79,6 +79,37 @@ codex-gateway -- codex app-server
 | Variable | Description | Default |
 |---|---|---|
 | `CODEX_MODEL` | Override the model used for all threads/turns | _(codex default)_ |
+| `CODEX_APPROVAL_POLICY` | When Codex asks before acting: `untrusted`, `on-failure`, `on-request`, `never` | `on-request` |
+| `CODEX_SANDBOX` | Sandbox for command execution: `read-only`, `workspace-write`, `danger-full-access` | `read-only` |
+
+Unrecognized values fall back to the default and log a warning rather than
+being passed through to Codex.
+
+> [!WARNING]
+> `CODEX_APPROVAL_POLICY=never` means Codex never sends an approval request, so
+> tool calls run without reaching agentrq for human review.
+> `CODEX_SANDBOX=danger-full-access` removes the sandbox boundary entirely.
+> The gateway logs a prominent warning when either is set.
+
+### Approvals
+
+Codex sends approval requests to the gateway as JSON-RPC requests. The gateway
+forwards each one to agentrq as a `permission_request` and blocks the turn until
+the human answers in the dashboard:
+
+| Codex request | Approved | Denied |
+|---|---|---|
+| `item/commandExecution/requestApproval` | `accept` | `decline` |
+| `item/fileChange/requestApproval` | `accept` | `decline` |
+| `item/permissions/requestApproval` | grants the requested profile for the turn | grants nothing |
+
+Approval requests identify their subject only by `itemId`, so the gateway
+remembers each item announced via `item/started` and uses it to show the human
+the real command, tool, or file list. Entries are dropped as items complete.
+
+agentrq's own MCP tool calls are auto-allowed, matched on the MCP server name
+(`agentrq-<workspaceId>`) rather than on free text, so a shell command that
+merely mentions a workspace id cannot approve itself.
 
 ### Configuration
 
