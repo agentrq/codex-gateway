@@ -19,6 +19,11 @@ import {
   type ThreadStartParams,
 } from "./codexClient.js";
 import { extractTaskIdFromMeta, extractTaskIdFromText } from "./taskIdentity.js";
+import {
+  resolveThreadPolicy,
+  ThreadItemRegistry,
+  type ItemDescriptor,
+} from "./approvals.js";
 
 export function buildTaskPrompt(taskId: string, content: string): string {
   return [
@@ -33,6 +38,14 @@ export function buildTaskPrompt(taskId: string, content: string): string {
   ].join("\n");
 }
 
+/** An approval request as it will be presented to the human in agentrq. */
+type ApprovalContext = ItemDescriptor & { reason: string };
+
+/**
+ * agentrq's own MCP server names, e.g. `agentrq-0cHdAEOUJvN`.
+ */
+const AGENTRQ_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
+
 export async function handleTask(
   content: string,
   meta: unknown,
@@ -45,16 +58,21 @@ export async function handleTask(
 
   let threadId = chatId ? threadMap.get(chatId) : undefined;
   if (!threadId) {
-    const sandbox = (process.env.CODEX_SANDBOX ?? "read-only") as ThreadStartParams["sandbox"];
+    const policy = resolveThreadPolicy();
+    for (const warning of policy.warnings) {
+      console.error(`\n⚠️  [codex] ${warning}`);
+    }
     const threadParams: ThreadStartParams = {
       cwd: process.cwd(),
-      sandbox,
+      approvalPolicy: policy.approvalPolicy,
+      sandbox: policy.sandbox,
     };
     if (model) threadParams.model = model;
     threadId = await codexClient.startThread(threadParams);
     if (chatId) threadMap.set(chatId, threadId);
     console.error(
-      `[codex] Created thread ${threadId} for chat ${chatId ?? "unknown"}`,
+      `[codex] Created thread ${threadId} for chat ${chatId ?? "unknown"} ` +
+        `(approvalPolicy=${policy.approvalPolicy}, sandbox=${policy.sandbox})`,
     );
   } else {
     console.error(`[codex] Reusing thread ${threadId} for chat ${chatId}`);
@@ -62,51 +80,147 @@ export async function handleTask(
 
   const taskContent = chatId ? buildTaskPrompt(chatId, content) : content;
 
-  const AGENTRQ_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
+  // Approval requests name their subject only by `itemId`; the command or tool
+  // itself was announced earlier in an `item/started` notification. Track those
+  // so the human sees what they are actually approving.
+  const registry = new ThreadItemRegistry();
 
-  const onApprovalRequest = async (data: { id: number; params: unknown }) => {
-    const params = data.params as Record<string, unknown> | undefined;
-    const reason = typeof params?.reason === "string" ? params.reason : "Unknown command";
+  const onItemStarted = (params: unknown) => {
+    const p = params as Record<string, unknown> | undefined;
+    if (p?.threadId !== threadId) return;
+    registry.record(p?.item);
+  };
+
+  const onItemCompleted = (params: unknown) => {
+    const p = params as Record<string, unknown> | undefined;
+    if (p?.threadId !== threadId) return;
+    const item = p?.item as Record<string, unknown> | undefined;
+    registry.forget(item?.id);
+  };
+
+  // Verdicts arrive on a single bridge-wide event. Keep the waiters keyed by
+  // request id and tear them all down when the turn ends, so a handler never
+  // outlives its turn and every in-flight request still gets an answer.
+  const pendingVerdicts = new Map<string, (decision: "allow" | "deny") => void>();
+
+  const onVerdict = (verdict: { requestId: string; behavior: string }) => {
+    const resolve = pendingVerdicts.get(verdict.requestId);
+    if (!resolve) return;
+    pendingVerdicts.delete(verdict.requestId);
+    const decision = verdict.behavior === "allow" ? "allow" : "deny";
+    console.error(`✅ [codex] Permission verdict: ${verdict.behavior} → ${decision}`);
+    resolve(decision);
+  };
+
+  /**
+   * Describe an approval request, preferring the remembered item over the
+   * sparse fields the request itself carries.
+   */
+  const describeApproval = (
+    params: Record<string, unknown> | undefined,
+    fallbackTitle: string,
+  ): ApprovalContext => {
+    const reason = typeof params?.reason === "string" ? params.reason : "";
+    const remembered = registry.get(params?.itemId);
+    if (remembered) return { ...remembered, reason };
+
+    // The item was never seen (or carried nothing describable) — fall back to
+    // whatever is on the request itself.
     const command = typeof params?.command === "string" ? params.command : "";
-    const toolTitle = typeof params?.tool_title === "string" ? params.tool_title : "";
-    const connectorId = typeof params?.connector_id === "string" ? params.connector_id : "";
+    return {
+      title: command || reason || fallbackTitle,
+      inputPreview: command,
+      reason,
+    };
+  };
 
-    // Auto-allow agentrq MCP tool calls (same pattern as acp-gateway)
-    const isAgentrqTool = AGENTRQ_PATTERN.test(toolTitle) || AGENTRQ_PATTERN.test(connectorId) || AGENTRQ_PATTERN.test(reason);
-    if (isAgentrqTool) {
-      console.error(`\n🔓 [codex] Auto-allowing agentrq tool: ${toolTitle || reason}`);
+  /**
+   * Auto-allow agentrq's own MCP tool calls, which the gateway itself depends
+   * on and which the human already implicitly approved by assigning the task.
+   *
+   * Deliberately keyed on the MCP server name alone. Matching free text such as
+   * a command line or a `reason` would let any command that merely mentions a
+   * workspace id approve itself.
+   */
+  const isAgentrqToolCall = (ctx: ApprovalContext): boolean =>
+    ctx.server !== undefined && AGENTRQ_PATTERN.test(ctx.server);
+
+  /** Forward an approval to agentrq and wait for the human's verdict. */
+  const routeToHuman = async (
+    requestId: string,
+    ctx: ApprovalContext,
+  ): Promise<"allow" | "deny"> => {
+    const decided = new Promise<"allow" | "deny">((resolve) =>
+      pendingVerdicts.set(requestId, resolve),
+    );
+
+    try {
+      await mcpBridge.sendNotification(
+        "notifications/claude/channel/permission_request",
+        {
+          request_id: requestId,
+          tool_name: ctx.title,
+          description: ctx.reason || ctx.title,
+          input_preview: ctx.inputPreview,
+        },
+      );
+    } catch (err) {
+      console.error("[codex] Failed to forward permission request:", err);
+      pendingVerdicts.delete(requestId);
+      return "deny";
+    }
+
+    console.error("⌛ [codex] Waiting for human approval in agentrq dashboard...");
+    return decided;
+  };
+
+  const nextRequestId = (id: number) => `codex-approval-${id}-${Date.now()}`;
+
+  const onCommandApproval = async (data: { id: number; params: unknown }) => {
+    const params = data.params as Record<string, unknown> | undefined;
+    const ctx = describeApproval(params, "Command execution");
+
+    if (isAgentrqToolCall(ctx)) {
+      console.error(`\n🔓 [codex] Auto-allowing agentrq tool: ${ctx.title}`);
       codexClient._sendResponse(data.id, { decision: "acceptForSession" });
       return;
     }
 
-    const requestId = `codex-approval-${data.id}-${Date.now()}`;
+    console.error(`\n🔐 [codex] Approval requested (command): ${ctx.title}`);
+    const decision = await routeToHuman(nextRequestId(data.id), ctx);
+    codexClient._sendResponse(data.id, {
+      decision: decision === "allow" ? "accept" : "decline",
+    });
+  };
 
-    console.error(`\n🔐 [codex] Approval requested: ${reason}`);
+  const onFileChangeApproval = async (data: { id: number; params: unknown }) => {
+    const params = data.params as Record<string, unknown> | undefined;
+    const ctx = describeApproval(params, "File change");
 
-    try {
-      await mcpBridge.sendNotification("notifications/claude/channel/permission_request", {
-        request_id: requestId,
-        tool_name: command || reason,
-        description: reason,
-        input_preview: command,
-      });
-    } catch (err) {
-      console.error("[codex] Failed to forward permission request:", err);
-      codexClient._sendResponse(data.id, { decision: "decline" });
-      return;
+    console.error(`\n🔐 [codex] Approval requested (file change): ${ctx.title}`);
+    const decision = await routeToHuman(nextRequestId(data.id), ctx);
+    codexClient._sendResponse(data.id, {
+      decision: decision === "allow" ? "accept" : "decline",
+    });
+  };
+
+  const onPermissionsApproval = async (data: { id: number; params: unknown }) => {
+    const params = data.params as Record<string, unknown> | undefined;
+    const requested = params?.permissions;
+    const ctx = describeApproval(params, "Additional permissions");
+    if (!registry.get(params?.itemId)) {
+      ctx.inputPreview = JSON.stringify(requested ?? {});
     }
 
-    console.error("⌛ [codex] Waiting for human approval in agentrq dashboard...");
-
-    const handler = (verdict: { requestId: string; behavior: string }) => {
-      if (verdict.requestId === requestId) {
-        mcpBridge.off("verdict", handler);
-        const decision = verdict.behavior === "allow" ? "accept" : "decline";
-        console.error(`✅ [codex] Permission verdict: ${verdict.behavior} → ${decision}`);
-        codexClient._sendResponse(data.id, { decision });
-      }
-    };
-    mcpBridge.on("verdict", handler);
+    console.error(`\n🔐 [codex] Approval requested (permissions): ${ctx.title}`);
+    const decision = await routeToHuman(nextRequestId(data.id), ctx);
+    // GrantedPermissionProfile mirrors the requested profile, and has no
+    // required fields — granting nothing denies the escalation while leaving
+    // the turn free to continue inside its existing sandbox.
+    codexClient._sendResponse(data.id, {
+      permissions: decision === "allow" ? (requested ?? {}) : {},
+      scope: "turn",
+    });
   };
 
   let replyText = "";
@@ -117,7 +231,12 @@ export async function handleTask(
     }
   };
 
-  codexClient.on("server-request:item/commandExecution/requestApproval", onApprovalRequest);
+  mcpBridge.on("verdict", onVerdict);
+  codexClient.on("notification:item/started", onItemStarted);
+  codexClient.on("notification:item/completed", onItemCompleted);
+  codexClient.on("server-request:item/commandExecution/requestApproval", onCommandApproval);
+  codexClient.on("server-request:item/fileChange/requestApproval", onFileChangeApproval);
+  codexClient.on("server-request:item/permissions/requestApproval", onPermissionsApproval);
   codexClient.on("notification:item/agentMessage/delta", onDelta);
 
   try {
@@ -128,8 +247,19 @@ export async function handleTask(
   } catch (err) {
     console.error("[codex] Turn error:", err);
   } finally {
-    codexClient.off("server-request:item/commandExecution/requestApproval", onApprovalRequest);
+    mcpBridge.off("verdict", onVerdict);
+    codexClient.off("notification:item/started", onItemStarted);
+    codexClient.off("notification:item/completed", onItemCompleted);
+    codexClient.off("server-request:item/commandExecution/requestApproval", onCommandApproval);
+    codexClient.off("server-request:item/fileChange/requestApproval", onFileChangeApproval);
+    codexClient.off("server-request:item/permissions/requestApproval", onPermissionsApproval);
     codexClient.off("notification:item/agentMessage/delta", onDelta);
+
+    // The turn is over; anything still waiting on a human will never be
+    // answered, so deny it rather than leaving codex blocked on a response.
+    for (const resolve of pendingVerdicts.values()) resolve("deny");
+    pendingVerdicts.clear();
+    registry.clear();
   }
 
   if (replyText.trim() && chatId) {
