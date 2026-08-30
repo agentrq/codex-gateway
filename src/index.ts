@@ -24,6 +24,7 @@ import {
   ThreadItemRegistry,
   type ItemDescriptor,
 } from "./approvals.js";
+import { resolveElicitation } from "./elicitation.js";
 
 export function buildTaskPrompt(taskId: string, content: string): string {
   return [
@@ -274,6 +275,18 @@ export async function handleTask(
   }
 }
 
+/** Find the agentrq chat/task a codex thread was started for. */
+export function findChatIdForThread(
+  threadMap: Map<string, string>,
+  threadId: unknown,
+): string | undefined {
+  if (typeof threadId !== "string") return undefined;
+  for (const [chatId, mapped] of threadMap) {
+    if (mapped === threadId) return chatId;
+  }
+  return undefined;
+}
+
 export async function checkForNextTask(
   mcpBridge: MCPBridge,
   codexClient: CodexClient,
@@ -341,6 +354,20 @@ async function main() {
 
   const model = process.env.CODEX_MODEL;
   const threadMap = new Map<string, string>(); // chatId → threadId
+
+  // Bridge: Codex MCP servers → agentrq. Elicitations are not scoped to a turn
+  // the gateway is driving, so this stays registered for the process lifetime.
+  codexClient.on(
+    "server-request:mcpServer/elicitation/request",
+    async (data: { id: number; params: unknown }) => {
+      const response = await resolveElicitation(data.params, {
+        mcpBridge,
+        resolveTaskId: (threadId) => findChatIdForThread(threadMap, threadId),
+      });
+      console.error(`[codex] Elicitation resolved: ${response.action}`);
+      codexClient._sendResponse(data.id, response);
+    },
+  );
 
   // Bridge: MCP → Codex
   mcpBridge.on("task", async ({ content, meta }) => {
