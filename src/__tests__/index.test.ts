@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { buildTaskPrompt, handleTask, checkForNextTask } from "../index.js";
+import {
+  buildTaskPrompt,
+  handleTask,
+  checkForNextTask,
+  findChatIdForThread,
+} from "../index.js";
 
 type MockCodexClient = EventEmitter & {
   startThread: ReturnType<typeof vi.fn>;
@@ -834,5 +839,25 @@ describe("index", () => {
 
       expect(mockCodexClient.startThread).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("findChatIdForThread", () => {
+  const threadMap = new Map<string, string>([
+    ["chat-a", "thr_1"],
+    ["chat-b", "thr_2"],
+  ]);
+
+  it("should find the chat a thread was started for", () => {
+    expect(findChatIdForThread(threadMap, "thr_2")).toBe("chat-b");
+  });
+
+  it("should return undefined for an unmapped thread", () => {
+    expect(findChatIdForThread(threadMap, "thr_9")).toBeUndefined();
+  });
+
+  it("should return undefined for a non-string thread id", () => {
+    expect(findChatIdForThread(threadMap, undefined)).toBeUndefined();
+    expect(findChatIdForThread(threadMap, 3)).toBeUndefined();
   });
 });

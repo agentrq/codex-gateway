@@ -111,6 +111,20 @@ agentrq's own MCP tool calls are auto-allowed, matched on the MCP server name
 (`agentrq-<workspaceId>`) rather than on free text, so a shell command that
 merely mentions a workspace id cannot approve itself.
 
+### Elicitations
+
+When an MCP server configured in `.codex/config.toml` asks a question
+(`mcpServer/elicitation/request`), the gateway forwards it to agentrq's `elicit`
+tool and returns the human's answer to Codex. Both `form` and `url` modes are
+supported, and the three-action result (`accept` / `decline` / `cancel`) maps
+one-to-one.
+
+If the elicitation belongs to a thread with no associated task — it arrived
+outside any task the gateway is running — a task is created and marked ongoing
+so the question still reaches the human. Anything that goes wrong (unsupported
+mode, tool error, unreachable human) resolves to `cancel`, since Codex is
+blocked on a response either way.
+
 ### Configuration
 
 `codex-gateway` searches for `.mcp.json` starting in the current working directory and up to 3 parent directories.
