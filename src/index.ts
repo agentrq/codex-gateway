@@ -331,8 +331,27 @@ export async function checkForNextTask(
   }
 }
 
+/**
+ * This package is deprecated in favour of @agentrq/acp-gateway. Printed on
+ * every start so existing installs learn about the replacement.
+ */
+function printDeprecationNotice() {
+  console.error(
+    [
+      "",
+      "  ! @agentrq/codex-gateway is DEPRECATED and no longer maintained.",
+      "    Use @agentrq/acp-gateway, which runs Codex via the codex-acp agent:",
+      "",
+      "      npx @agentrq/acp-gateway@latest --login --agent codex-acp",
+      "      npx @agentrq/acp-gateway@latest --agent codex-acp",
+      "",
+    ].join("\n"),
+  );
+}
+
 async function main() {
   console.log(`Starting [codex-gateway] ${pkg.name} v${pkg.version}`);
+  printDeprecationNotice();
 
   const args = process.argv.slice(2);
   const cmdStartIndex = args.indexOf("--");
