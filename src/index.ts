@@ -11,7 +11,6 @@ const pkg = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
 );
 
-import { loadMcpConfig, pickAgentrqServer } from "./config.js";
 import { MCPBridge } from "./mcpClient.js";
 import {
   CodexClient,
@@ -24,7 +23,6 @@ import {
   ThreadItemRegistry,
   type ItemDescriptor,
 } from "./approvals.js";
-import { resolveElicitation } from "./elicitation.js";
 
 export function buildTaskPrompt(taskId: string, content: string): string {
   return [
@@ -332,84 +330,29 @@ export async function checkForNextTask(
 }
 
 /**
- * This package is deprecated in favour of @agentrq/acp-gateway. Printed on
- * every start so existing installs learn about the replacement.
+ * The gateway itself is gone: @agentrq/codex-gateway is deprecated in favour of
+ * @agentrq/acp-gateway, which drives Codex through the codex-acp agent. The CLI
+ * now only points people at the replacement and exits non-zero, so anything
+ * still invoking it fails loudly instead of silently doing nothing.
  */
-function printDeprecationNotice() {
+function main(): never {
   console.error(
     [
       "",
-      "  ! @agentrq/codex-gateway is DEPRECATED and no longer maintained.",
-      "    Use @agentrq/acp-gateway, which runs Codex via the codex-acp agent:",
+      `  ${pkg.name} v${pkg.version} is DEPRECATED and no longer runs.`,
       "",
-      "      npx @agentrq/acp-gateway@latest --login --agent codex-acp",
-      "      npx @agentrq/acp-gateway@latest --agent codex-acp",
+      "  Use @agentrq/acp-gateway, which runs Codex via the codex-acp agent:",
+      "",
+      "    npx @agentrq/acp-gateway@latest --login --agent codex-acp",
+      "    npx @agentrq/acp-gateway@latest --agent codex-acp",
+      "",
+      "  See https://github.com/agentrq/codex-gateway for details.",
       "",
     ].join("\n"),
   );
-}
-
-async function main() {
-  console.log(`Starting [codex-gateway] ${pkg.name} v${pkg.version}`);
-  printDeprecationNotice();
-
-  const args = process.argv.slice(2);
-  const cmdStartIndex = args.indexOf("--");
-  const codexArgs = cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : [];
-
-  const [codexCmd, ...codexCmdArgs] =
-    codexArgs.length > 0 ? codexArgs : ["codex", "app-server"];
-
-  // Load MCP config and connect to agentrq
-  const configs = loadMcpConfig();
-  const agentrqConfig = pickAgentrqServer(configs);
-  const mcpBridge = new MCPBridge(agentrqConfig);
-  await mcpBridge.connect();
-
-  // Start codex app-server
-  console.error(`[codex] Spawning: ${codexCmd} ${codexCmdArgs.join(" ")}`);
-  const codexClient = new CodexClient(codexCmd, codexCmdArgs);
-  await codexClient.start();
-
-  const model = process.env.CODEX_MODEL;
-  const threadMap = new Map<string, string>(); // chatId → threadId
-
-  // Bridge: Codex MCP servers → agentrq. Elicitations are not scoped to a turn
-  // the gateway is driving, so this stays registered for the process lifetime.
-  codexClient.on(
-    "server-request:mcpServer/elicitation/request",
-    async (data: { id: number; params: unknown }) => {
-      const response = await resolveElicitation(data.params, {
-        mcpBridge,
-        resolveTaskId: (threadId) => findChatIdForThread(threadMap, threadId),
-      });
-      console.error(`[codex] Elicitation resolved: ${response.action}`);
-      codexClient._sendResponse(data.id, response);
-    },
-  );
-
-  // Bridge: MCP → Codex
-  mcpBridge.on("task", async ({ content, meta }) => {
-    console.error(
-      "\n[bridge] Incoming task from MCP server. Forwarding to Codex...",
-    );
-    try {
-      await handleTask(content, meta, codexClient, mcpBridge, threadMap, model);
-    } catch (err) {
-      console.error("[bridge] Error handling task:", err);
-    }
-  });
-
-  // Initial check for pending tasks
-  await checkForNextTask(mcpBridge, codexClient, threadMap, model);
-
-  // Keep the process alive
-  await new Promise(() => {});
+  process.exit(1);
 }
 
 if (process.env.NODE_ENV !== "test") {
-  main().catch((err) => {
-    console.error("[fatal]", err);
-    process.exit(1);
-  });
+  main();
 }
