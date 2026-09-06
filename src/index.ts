@@ -346,7 +346,9 @@ function main(): never {
       "    npx @agentrq/acp-gateway@latest --login --agent codex-acp",
       "    npx @agentrq/acp-gateway@latest --agent codex-acp",
       "",
-      "  See https://github.com/agentrq/codex-gateway for details.",
+      "  More details:",
+      "    Repository:  https://github.com/agentrq/acp-gateway",
+      "    Setup guide: https://agentrq.com/docs/connect-codex-gateway",
       "",
     ].join("\n"),
   );
